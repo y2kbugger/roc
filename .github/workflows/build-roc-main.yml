@@ -1,0 +1,95 @@
+# Manually triggered build of the roc compiler from upstream roc-lang/roc.
+# Lives on the fork's `ci-build-main` branch so `main` stays a mirror.
+#
+#   gh workflow run build-roc-main.yml -R y2kbugger/roc --ref ci-build-main [-f ref=main]
+#   gh run list -R y2kbugger/roc -w build-roc-main.yml
+#   gh run download <run-id> -R y2kbugger/roc          # or fetch-roc-main.sh in roc-intro
+#
+# Mirrors the linux_x86_64 leg of roc-lang/nightlies' nightly workflow:
+# `zig build build-release`, statically linked, packaged like a nightly.
+# Note: since roc-lang/roc#11359 the binary needs SHA-256 hardware
+# (Intel Ice Lake+/AMD Zen, not Skylake..Comet Lake) to run.
+name: Build roc from upstream main
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "roc-lang/roc ref to build (branch, tag or sha)"
+        type: string
+        default: main
+      publish_release:
+        description: "Also publish a GitHub release on this fork tagged main-<date>-<sha>"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout upstream roc at ${{ inputs.ref }}
+        uses: actions/checkout@v6
+        with:
+          repository: roc-lang/roc
+          ref: ${{ inputs.ref }}
+          path: roc-src
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Print CPU model
+        run: lscpu | grep "Model name"; grep -o sha_ni /proc/cpuinfo | head -1 || echo "no sha_ni on this runner"
+
+      - name: Resolve version strings
+        id: v
+        run: |
+          cd roc-src
+          SHA=$(git rev-parse --short=10 HEAD)
+          DATE=$(date -u +%Y-%m-%d)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=main-$DATE-$SHA" >> "$GITHUB_OUTPUT"
+          echo "folder=roc_main-linux_x86_64-$DATE-$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Build release compiler
+        run: cd roc-src && zig build build-release -Dcompiler-version=${{ steps.v.outputs.tag }}
+
+      - name: Check static linking and version
+        run: |
+          file ./roc-src/zig-out/bin/roc | grep "statically linked"
+          ./roc-src/zig-out/bin/roc version
+
+      - name: Package
+        run: |
+          F=${{ steps.v.outputs.folder }}
+          mkdir -p "$F"
+          cp ./roc-src/zig-out/bin/roc ./roc-src/LICENSE ./roc-src/legal_details "$F"/
+          tar -czf "$F.tar.gz" "$F"
+          sha256sum "$F.tar.gz" | tee "$F.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.v.outputs.folder }}
+          path: |
+            ${{ steps.v.outputs.folder }}.tar.gz
+            ${{ steps.v.outputs.folder }}.tar.gz.sha256
+          retention-days: 30
+
+      - name: Publish release on this fork
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.v.outputs.tag }}" \
+            "${{ steps.v.outputs.folder }}.tar.gz" "${{ steps.v.outputs.folder }}.tar.gz.sha256" \
+            --repo "${{ github.repository }}" \
+            --title "roc from upstream ${{ inputs.ref }} @ ${{ steps.v.outputs.sha }}" \
+            --notes "Built by build-roc-main.yml from roc-lang/roc ${{ inputs.ref }} (${{ steps.v.outputs.sha }}) with zig ${{ env.ZIG_VERSION }}: \`zig build build-release\`, linux x86_64, static. Needs a CPU with SHA-256 instructions (roc-lang/roc#11359)."
