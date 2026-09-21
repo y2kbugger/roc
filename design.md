@@ -11618,6 +11618,17 @@ call site's expected descriptor. ARC and every consumer use the descriptor
 output attached to the returned value; they do not treat the expected descriptor
 as evidence about bytes returned by a compiler worker.
 
+A direct `Str.inspect` call obliges every custom `to_inspect` its argument's
+shape reaches, not only one declared by the argument's own type. The checker
+walks the positions inspect lowering renders (a type with a custom method ends
+the walk at that method; `List` and `Box` render their item; a transparent
+nominal renders its backing and an opaque one renders as `<opaque>`; records,
+tuples and tag unions render their members) and unifies each reached method
+with `T -> Str` at the application found there, so a method with the wrong
+signature or a `where` clause the application cannot satisfy is reported at
+check time. Lowering relies on this: a reached method whose `where` evidence
+has no checked target is an invariant violation, not a diagnostic.
+
 Checked direct and function-value uses of the generic `Str.inspect` intrinsic,
 `dbg`, and `expect_err` produce inspect-method demands in the Boxy plan. Demands
 propagate through the recorded worker/call/operand type substitutions and

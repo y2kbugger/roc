@@ -22126,11 +22126,15 @@ fn validateToInspectMethodTypes(self: *Self, env: *Env) Allocator.Error!void {
         if (!self.exprIsBuiltinStrInspect(call.func)) continue;
         const args = self.cir.store.sliceExpr(call.args);
         if (args.len != 1) continue;
-        try self.validateToInspectMethodTypeForArg(
+        const rejected = try self.validateToInspectMethodTypeForArg(
             args[0],
             env,
             self.cir.store.getExprRegion(args[0]),
         );
+        // An inspect call that reaches a method it cannot call has no value;
+        // lowering must see the call itself as erroneous rather than go
+        // looking for the method the checker just rejected.
+        if (rejected) try self.retireCallLikeExpr(expr_idx, ModuleEnv.varFrom(expr_idx));
     }
 }
 
@@ -22155,28 +22159,109 @@ fn validateToInspectMethodTypeForArg(
     arg_expr_idx: CIR.Expr.Idx,
     env: *Env,
     region: Region,
-) Allocator.Error!void {
+) Allocator.Error!bool {
     const arg_var = ModuleEnv.varFrom(arg_expr_idx);
-    const resolved = self.types.resolveVar(arg_var);
 
     if (self.exprIsTopLevelLookup(arg_expr_idx)) {
         self.inspect_type_visits.clearRetainingCapacity();
         if (try self.varHasUnresolvedInspectContent(arg_var, .value, &self.inspect_type_visits)) {
             try self.reportPolymorphicValueProblem(arg_var, arg_var, null);
-            return;
+            return false;
         }
     }
+    var walk = DerivedCodecWalk.init(self.gpa, 0);
+    defer walk.deinit();
+    return try self.validateReachableToInspectMethodTypes(arg_var, &walk, env, region);
+}
+
+/// `Str.inspect` renders a value structurally and calls a custom `to_inspect`
+/// wherever the shape reaches a type that declares one, so every such method
+/// is an obligation of the inspect call and its type (including its `where`
+/// clauses) is checked against the concrete application found there.
+///
+/// The positions visited are exactly the ones inspect lowering visits: a type
+/// with a custom method ends the walk at that method, `List` and `Box` render
+/// their item, a transparent nominal renders its backing, an opaque one
+/// renders as `<opaque>`, and records, tuples and tag unions render their
+/// members.
+fn validateReachableToInspectMethodTypes(
+    self: *Self,
+    var_: Var,
+    walk: *DerivedCodecWalk,
+    env: *Env,
+    region: Region,
+) Allocator.Error!bool {
+    const resolved = self.types.resolveVar(var_);
     switch (resolved.desc.content) {
         .structure => |structure| switch (structure) {
-            .nominal_type => |nominal| try self.validateNominalToInspectMethodType(arg_var, nominal, env, region),
-            .record, .tuple, .fn_pure, .fn_effectful, .fn_unbound, .empty_record, .tag_union, .empty_tag_union => {},
+            .nominal_type => |nominal| {
+                if (try self.toInspectMethodVarForNominal(nominal, env, region)) |method| {
+                    if (walk.visited.contains(resolved.var_)) return false;
+                    try walk.visited.put(resolved.var_, {});
+                    return try self.validateToInspectMethodVar(var_, method.var_, method.dispatcher_name, env, region);
+                }
+                if (self.nominalIsBuiltinListType(nominal) or self.nominalIsBoxType(nominal)) {
+                    // The argument list points into the types store, which
+                    // validating a method can grow.
+                    const args = try self.gpa.dupe(Var, self.types.sliceNominalArgs(nominal));
+                    defer self.gpa.free(args);
+                    var rejected = false;
+                    for (args) |arg| rejected = try self.validateReachableToInspectMethodTypes(arg, walk, env, region) or rejected;
+                    return rejected;
+                }
+                if (nominal.originIsBuiltin() or nominal.isOpaque()) return false;
+                const backing_var = (try self.openNominalBackingForApp(nominal, env, region)) orelse return false;
+                if (try self.takeDerivedCodecBackingWalk(walk, nominal) != .walk_backing) return false;
+                return try self.validateReachableToInspectMethodTypes(backing_var, walk, env, region);
+            },
+            .record => |record| {
+                if (walk.visited.contains(resolved.var_)) return false;
+                try walk.visited.put(resolved.var_, {});
+                const presences = try self.gpa.dupe(
+                    types_mod.RecordField.Presence,
+                    self.types.getRecordFieldsSlice(record.fields).items(.presence),
+                );
+                defer self.gpa.free(presences);
+                var rejected = false;
+                for (presences) |presence| rejected = try self.validateReachableToInspectMethodTypes(presence.typeVar(), walk, env, region) or rejected;
+                return try self.validateReachableToInspectMethodTypes(record.ext, walk, env, region) or rejected;
+            },
+            .tuple => |tuple| {
+                if (walk.visited.contains(resolved.var_)) return false;
+                try walk.visited.put(resolved.var_, {});
+                const items = try self.gpa.dupe(Var, self.types.sliceVars(tuple.elems));
+                defer self.gpa.free(items);
+                var rejected = false;
+                for (items) |item| rejected = try self.validateReachableToInspectMethodTypes(item, walk, env, region) or rejected;
+                return rejected;
+            },
+            .tag_union => |tag_union| {
+                if (walk.visited.contains(resolved.var_)) return false;
+                try walk.visited.put(resolved.var_, {});
+                var payloads = std.ArrayList(Var).empty;
+                defer payloads.deinit(self.gpa);
+                for (self.types.getTagsSlice(tag_union.tags).items(.args)) |tag_args| {
+                    try payloads.appendSlice(self.gpa, self.types.sliceVars(tag_args));
+                }
+                var rejected = false;
+                for (payloads.items) |payload| rejected = try self.validateReachableToInspectMethodTypes(payload, walk, env, region) or rejected;
+                return try self.validateReachableToInspectMethodTypes(tag_union.ext, walk, env, region) or rejected;
+            },
+            .fn_pure, .fn_effectful, .fn_unbound, .empty_record, .empty_tag_union => return false,
         },
-        .alias => |alias| try self.validateAliasToInspectMethodType(arg_var, alias, env, region),
+        .alias => |alias| {
+            if (try self.toInspectMethodVarForAlias(alias, env, region)) |method| {
+                if (walk.visited.contains(resolved.var_)) return false;
+                try walk.visited.put(resolved.var_, {});
+                return try self.validateToInspectMethodVar(var_, method.var_, method.dispatcher_name, env, region);
+            }
+            return try self.validateReachableToInspectMethodTypes(self.types.getAliasBackingVar(alias), walk, env, region);
+        },
         .flex,
         .rigid,
         .err,
         .field_presence,
-        => {},
+        => return false,
     }
 }
 
@@ -22184,28 +22269,6 @@ fn exprIsTopLevelLookup(self: *Self, expr_idx: CIR.Expr.Idx) bool {
     const expr = self.cir.store.getExpr(expr_idx);
     if (expr != .e_lookup_local) return false;
     return self.patternIsTopLevelDef(expr.e_lookup_local.pattern_idx);
-}
-
-fn validateNominalToInspectMethodType(
-    self: *Self,
-    arg_var: Var,
-    nominal: types_mod.NominalType,
-    env: *Env,
-    region: Region,
-) Allocator.Error!void {
-    const method = try self.toInspectMethodVarForNominal(nominal, env, region) orelse return;
-    try self.validateToInspectMethodVar(arg_var, method.var_, method.dispatcher_name, env, region);
-}
-
-fn validateAliasToInspectMethodType(
-    self: *Self,
-    arg_var: Var,
-    alias: types_mod.Alias,
-    env: *Env,
-    region: Region,
-) Allocator.Error!void {
-    const method = try self.toInspectMethodVarForAlias(alias, env, region) orelse return;
-    try self.validateToInspectMethodVar(arg_var, method.var_, method.dispatcher_name, env, region);
 }
 
 const ToInspectMethodVar = struct {
@@ -22220,7 +22283,7 @@ fn validateToInspectMethodVar(
     dispatcher_name: Ident.Idx,
     env: *Env,
     region: Region,
-) Allocator.Error!void {
+) Allocator.Error!bool {
     const str_var = try self.freshStr(env, region);
     const args_range = try self.types.appendVars(&.{arg_var});
     const expected_fn_var = try self.freshFromContent(.{ .structure = .{ .fn_unbound = Func{
@@ -22235,7 +22298,9 @@ fn validateToInspectMethodVar(
     } });
     if (result.isProblem()) {
         try self.markErroneous(expected_fn_var);
+        return true;
     }
+    return false;
 }
 
 fn toInspectMethodVarForNominal(
