@@ -15198,7 +15198,7 @@ test "static-data slots with constant images are internal constants and function
     try std.testing.expect(callable.init == .no_init);
 }
 
-fn rcHelperIsNoinline(codegen: *MonoLlvmCodeGen, builder: *const LlvmBuilder, helper_key: layout.RcHelperKey) !bool {
+fn rcHelperIsNoinline(codegen: *MonoLlvmCodeGen, builder: *const LlvmBuilder, helper_key: layout.RcHelperKey) MonoLlvmCodeGen.Error!bool {
     const func = try codegen.declareRefcountedRcHelper(helper_key, .atomic);
     const attributes = func.ptrConst(builder).attributes.func(builder);
     for (attributes.slice(builder)) |attribute| {
