@@ -20323,6 +20323,126 @@ fn collectCheckResult(
     return result;
 }
 
+/// `roc check --json`: for a tool that generates Roc and maps Roc's answers
+/// back to its own source. On stdout, one JSON object: every problem the
+/// check found, with the file and span it is about, and the type of each
+/// top-level definition of ROC_FILE, inferred or annotated, written as hover
+/// writes it. The exit code is the plain check's.
+fn rocCheckJson(ctx: *CliCtx, args: cli_args.CheckArgs) RocCheckError!void {
+    const stdout = ctx.io.stdout();
+    const stderr = ctx.io.stderr();
+    const cache_config = CacheConfig{
+        .enabled = !args.no_cache,
+        .verbose = false,
+        .roc_ctx = ctx.coreCtx(),
+    };
+    var result_with_env = checkFileWithBuildEnvPreserved(
+        ctx,
+        args.path,
+        args.main,
+        args.root_source_url,
+        args.main_source_url,
+        false,
+        cache_config,
+        args.max_threads,
+        resolutionConfigFromLimits(args.resolve_limits),
+        null,
+        false,
+        null,
+        null,
+    ) catch |err| return handleProcessFileError(err, stderr, args.path);
+    defer result_with_env.deinit(ctx.gpa);
+    const check_result = &result_with_env.check_result;
+
+    var json: std.json.Stringify = .{ .writer = stdout };
+    try json.beginObject();
+    try json.objectField("errors");
+    try json.write(check_result.error_count);
+    try json.objectField("warnings");
+    try json.write(check_result.warning_count);
+    try json.objectField("problems");
+    try json.beginArray();
+    for (check_result.reports) |module| {
+        for (module.reports) |*report| try writeJsonProblem(ctx, &json, module.file_path, report);
+    }
+    try json.endArray();
+    try json.objectField("definitions");
+    try json.beginArray();
+    const absolute = std.Io.Dir.cwd().realPathFileAlloc(ctx.io.std_io, args.path, ctx.arena) catch args.path;
+    if (result_with_env.build_env.findModuleByPath(absolute)) |module_state| {
+        if (module_state.moduleEnv()) |module_env| try writeJsonDefinitions(&json, module_env);
+    }
+    try json.endArray();
+    try json.endObject();
+    try stdout.writeAll("\n");
+    ctx.io.flush();
+    if (check_result.error_count > 0) return error.CheckFailed;
+}
+
+/// A problem as `roc check --json` writes it: its span is the report's
+/// first source region, lines and columns counted from 1, columns in bytes.
+fn writeJsonProblem(
+    ctx: *CliCtx,
+    json: *std.json.Stringify,
+    file_path: []const u8,
+    report: *const reporting.Report,
+) RocCheckError!void {
+    var message: std.Io.Writer.Allocating = .init(ctx.arena);
+    try reporting.renderReportToLsp(report, &message.writer, reporting.ReportingConfig.initLsp());
+    try json.beginObject();
+    try json.objectField("file");
+    try json.write(report.file orelse file_path);
+    try json.objectField("severity");
+    try json.write(switch (report.severity) {
+        .warning => "warning",
+        .runtime_error, .fatal => "error",
+    });
+    try json.objectField("title");
+    try json.write(report.title);
+    if (report.getRegionInfo()) |region| {
+        try json.objectField("line");
+        try json.write(region.start_line_idx);
+        try json.objectField("column");
+        try json.write(region.start_col_idx);
+        try json.objectField("end_line");
+        try json.write(region.end_line_idx);
+        try json.objectField("end_column");
+        try json.write(region.end_col_idx);
+    }
+    try json.objectField("message");
+    try json.write(message.written());
+    try json.endObject();
+}
+
+/// Each top-level definition a name is bound to, and its type on one line.
+fn writeJsonDefinitions(json: *std.json.Stringify, module_env: *ModuleEnv) RocCheckError!void {
+    var type_writer = try module_env.initTypeWriter();
+    defer type_writer.deinit();
+    for (module_env.store.sliceDefs(module_env.all_defs)) |def_idx| {
+        const def = module_env.store.getDef(def_idx);
+        const ident = switch (module_env.store.getPattern(def.pattern)) {
+            .assign => |assign| assign.ident,
+            else => continue,
+        };
+        const region = module_env.calcRegionInfo(module_env.store.getPatternRegion(def.pattern));
+        type_writer.reset();
+        type_writer.write(ModuleEnv.varFrom(def.pattern), .one_line) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        try json.beginObject();
+        try json.objectField("name");
+        try json.write(module_env.getIdent(ident));
+        try json.objectField("line");
+        try json.write(region.start_line_idx + 1);
+        try json.objectField("annotated");
+        try json.write(def.annotation != null);
+        try json.objectField("type");
+        try json.write(type_writer.get());
+        try json.endObject();
+    }
+}
+
 fn finishRocCheck(
     ctx: *CliCtx,
     args: cli_args.CheckArgs,
@@ -20509,6 +20629,8 @@ fn rocCheck(ctx: *CliCtx, args_in: cli_args.CheckArgs, arg0: []const u8) RocChec
     if (args.watch) {
         return runWatchCommand(ctx, arg0, .{ .check = args });
     }
+
+    if (args.json) return rocCheckJson(ctx, args);
 
     const stdout = ctx.io.stdout();
     const stderr = ctx.io.stderr();

@@ -210,6 +210,7 @@ pub const CheckArgs = struct {
     no_cache: bool = false, // disable cache
     verbose: bool = false, // enable verbose output
     watch: bool = false, // rerun check when source inputs change
+    json: bool = false, // write the problems and the file's definitions' types as JSON on stdout
     watch_inputs_file: ?[]const u8 = null, // internal: write watch input paths and byte states here
     max_threads: ?usize = null, // max worker threads (null = auto, 1 = single-threaded)
     resolve_limits: ResolveLimitArgs = .{}, // package download size limits
@@ -982,6 +983,7 @@ const commands = [_]Command{
             .{ .name = "--no-cache", .field = "no_cache", .help = "Disable caching" },
             .{ .name = "--verbose", .field = "verbose", .help = "Enable verbose output including cache statistics" },
             .{ .name = "--watch", .field = "watch", .help = "Re-run when source inputs change" },
+            .{ .name = "--json", .field = "json", .help = "Write the problems, and the type of each top-level definition of ROC_FILE, as JSON on stdout" },
             watch_inputs_file_flag,
             jobs_flag,
         },
@@ -1950,6 +1952,13 @@ test "roc check" {
         defer result.deinit(gpa);
         try testing.expectEqualStrings("foo.roc", result.check.path);
         try testing.expectEqual(true, result.check.timings);
+    }
+    {
+        const result = try parse(gpa, testing.io, &[_][]const u8{ "check", "--json", "--main=app.roc", "Page.roc" });
+        defer result.deinit(gpa);
+        try testing.expectEqualStrings("Page.roc", result.check.path);
+        try testing.expectEqualStrings("app.roc", result.check.main.?);
+        try testing.expect(result.check.json);
     }
     {
         const result = try parse(gpa, testing.io, &[_][]const u8{ "check", "--watch", "foo.roc" });
@@ -3292,6 +3301,7 @@ test "golden help: roc check --help" {
         \\      --no-cache     Disable caching
         \\      --verbose      Enable verbose output including cache statistics
         \\      --watch        Re-run when source inputs change
+        \\      --json         Write the problems, and the type of each top-level definition of ROC_FILE, as JSON on stdout
         \\  -j, --jobs=<N>     Max worker threads for parallel compilation (default: auto-detect CPU count)
         \\      --replace-dep OLD NEW    Load NEW wherever a dependency declares exactly OLD, for this invocation only.
         \\                               Each is a complete package URL or a path to a root .roc file; repeatable.
