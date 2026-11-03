@@ -1990,27 +1990,40 @@ inline fn smallFromWords(words: SmallWords, length: usize) RocStr {
 const SmallDigits = @Int(.unsigned, 2 * @bitSizeOf(usize));
 const SmallDigitsShift = std.math.Log2Int(SmallDigits);
 
+/// Two digits from the pair table as they sit in the string's words: the
+/// tens digit in the lower byte.
+inline fn digitPairWord(value: u64) SmallDigits {
+    const pair = i128h.digitPair(value);
+    return @as(SmallDigits, pair[0]) | (@as(SmallDigits, pair[1]) << 8);
+}
+
 /// An integer of 64 bits or fewer as a small string built in whole words:
-/// the digits accumulate from the least significant, each at its byte, so
-/// nothing is stored narrower than a word and the caller's loads of the
-/// result forward from the stores; no digit buffer, no copy. At most
-/// `@sizeOf(SmallDigits)` characters, sign included: 16 on a 64-bit target
-/// (every U32 and I32, a U64 under 10^16), 8 on wasm32. False when it is
-/// longer, and the general path runs.
+/// the digits accumulate from the least significant, two at a time from the
+/// pair table, each at its byte, so nothing is stored narrower than a word
+/// and the caller's loads of the result forward from the stores; no digit
+/// buffer, no copy. At most `@sizeOf(SmallDigits)` characters, sign
+/// included: 16 on a 64-bit target (every U32 and I32, a U64 under 10^16),
+/// 8 on wasm32. False when it is longer, and the general path runs.
 fn smallIntToStr(out: *RocStr, magnitude: u64, negative: bool) bool {
     var count: usize = 1;
     var rest = magnitude;
-    while (rest >= 10) : (rest /= 10) count += 1;
+    while (rest >= 100) : (rest /= 100) count += 2;
+    if (rest >= 10) count += 1;
     const length = count + @intFromBool(negative);
     if (length > @sizeOf(SmallDigits)) return false;
     var digits: SmallDigits = if (negative) '-' else 0;
+    // `shift` is the byte of the least significant digit still unwritten; a
+    // pair's tens digit goes one byte below it.
     var shift: SmallDigitsShift = @intCast(8 * (length - 1));
     rest = magnitude;
-    while (true) {
-        digits |= @as(SmallDigits, '0' + @as(u8, @intCast(rest % 10))) << shift;
-        rest /= 10;
-        if (rest == 0) break;
-        shift -= 8;
+    while (rest >= 100) : (rest /= 100) {
+        digits |= digitPairWord(rest % 100) << (shift - 8);
+        shift -= 16;
+    }
+    if (rest >= 10) {
+        digits |= digitPairWord(rest) << (shift - 8);
+    } else {
+        digits |= @as(SmallDigits, '0' + @as(u8, @intCast(rest))) << shift;
     }
     out.* = smallFromWords(@as(SmallWords, digits), length);
     return true;

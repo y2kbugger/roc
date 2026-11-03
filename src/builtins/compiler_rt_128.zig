@@ -668,7 +668,8 @@ const digit_pairs = "00010203040506070809101112131415161718192021222324252627282
     "40414243444546474849505152535455565758596061626364656667686970717273747576777879" ++
     "8081828384858687888990919293949596979899";
 
-fn digitPair(value: u64) [2]u8 {
+/// The two decimal digits of `value`, which is below 100, tens first.
+pub fn digitPair(value: u64) [2]u8 {
     std.debug.assert(value < 100);
     return digit_pairs[@as(usize, @intCast(value)) * 2 ..][0..2].*;
 }
