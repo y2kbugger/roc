@@ -1968,8 +1968,65 @@ fn unsignedIntToStr(comptime T: type, buf: []u8, val: T) []const u8 {
     return i128h.u128_to_str(buf, @as(u128, @intCast(val))).str;
 }
 
+/// A small string's three words as one integer, its first byte lowest:
+/// 192 bits on a 64-bit target, 96 on wasm32.
+const SmallWords = @Int(.unsigned, 3 * @bitSizeOf(usize));
+const word_bits = @bitSizeOf(usize);
+
+/// The small string whose words are `words`: the bytes, then the flag byte
+/// (0x80 | length) in the last byte, as `RocStr.fromSliceSmall` lays it out.
+inline fn smallFromWords(words: SmallWords, length: usize) RocStr {
+    const flag = @as(SmallWords, RocStr.smallStrFlagByte(length)) << (@sizeOf(RocStr) * 8 - 8);
+    const all = words | flag;
+    return .{
+        .bytes = @ptrFromInt(@as(usize, @truncate(all))),
+        .capacity_or_alloc_ptr = @truncate(all >> word_bits),
+        .length = @truncate(all >> (2 * word_bits)),
+    };
+}
+
+/// The digits of a small integer's string, accumulated in two words: a
+/// shift of it is cheap, where one of the small string's three is not.
+const SmallDigits = @Int(.unsigned, 2 * @bitSizeOf(usize));
+const SmallDigitsShift = std.math.Log2Int(SmallDigits);
+
+/// An integer of 64 bits or fewer as a small string built in whole words:
+/// the digits accumulate from the least significant, each at its byte, so
+/// nothing is stored narrower than a word and the caller's loads of the
+/// result forward from the stores; no digit buffer, no copy. At most
+/// `@sizeOf(SmallDigits)` characters, sign included: 16 on a 64-bit target
+/// (every U32 and I32, a U64 under 10^16), 8 on wasm32. False when it is
+/// longer, and the general path runs.
+fn smallIntToStr(out: *RocStr, magnitude: u64, negative: bool) bool {
+    var count: usize = 1;
+    var rest = magnitude;
+    while (rest >= 10) : (rest /= 10) count += 1;
+    const length = count + @intFromBool(negative);
+    if (length > @sizeOf(SmallDigits)) return false;
+    var digits: SmallDigits = if (negative) '-' else 0;
+    var shift: SmallDigitsShift = @intCast(8 * (length - 1));
+    rest = magnitude;
+    while (true) {
+        digits |= @as(SmallDigits, '0' + @as(u8, @intCast(rest % 10))) << shift;
+        rest /= 10;
+        if (rest == 0) break;
+        shift -= 8;
+    }
+    out.* = smallFromWords(@as(SmallWords, digits), length);
+    return true;
+}
+
 /// Unified integer-to-string wrapper: dispatches on int_width/is_signed
 pub fn roc_builtins_int_to_str(out: *RocStr, val_low: u64, val_high: u64, int_width: u8, is_signed: bool) callconv(.c) void {
+    if (int_width <= 8) {
+        // Codegen sign-extends a signed value to 64 bits before splitting it
+        // (the LLVM backend through i128, wasm by a shift pair), so `val_low`
+        // is the value as an i64 whatever its width.
+        const signed_value: i64 = @bitCast(val_low);
+        const negative = is_signed and signed_value < 0;
+        const magnitude: u64 = if (negative) @bitCast(-%signed_value) else val_low;
+        if (smallIntToStr(out, magnitude, negative)) return;
+    }
     const roc_ops = in_process_host.ops();
     var buf: [40]u8 = undefined;
     const result = switch (int_width) {
@@ -1999,6 +2056,75 @@ pub fn roc_builtins_int_to_str(out: *RocStr, val_low: u64, val_high: u64, int_wi
         else => utils.builtinInvariant(roc_ops, "int_to_str integer width is not 1, 2, 4, 8, or 16 bytes"),
     };
     writeRocStrFromSlice(out, result, roc_ops);
+}
+
+test "roc_builtins_int_to_str: every width, the small path and the general one agree with a digit-by-digit reference" {
+    var env = utils.TestEnv.init(std.testing.allocator);
+    defer env.deinit();
+    const saved_host = in_process_host.enter(env.getOps(), null);
+    defer in_process_host.leave(saved_host);
+
+    // Each value as codegen passes it: sign-extended to 128 bits, then split.
+    const Case = struct { bits: u128, width: u8, signed: bool };
+    const S = struct {
+        fn signed(value: i128) u128 {
+            return @bitCast(value);
+        }
+
+        /// The decimal digits of `bits` read as a 128-bit integer, signed or
+        /// not, written one at a time from the least significant.
+        fn reference(buffer: []u8, bits: u128, is_signed: bool) []const u8 {
+            const negative = is_signed and @as(i128, @bitCast(bits)) < 0;
+            var magnitude: u128 = if (negative) @bitCast(-%@as(i128, @bitCast(bits))) else bits;
+            var end = buffer.len;
+            while (true) {
+                end -= 1;
+                buffer[end] = '0' + @as(u8, @intCast(magnitude % 10));
+                magnitude /= 10;
+                if (magnitude == 0) break;
+            }
+            if (negative) {
+                end -= 1;
+                buffer[end] = '-';
+            }
+            return buffer[end..];
+        }
+    };
+    const cases = [_]Case{
+        .{ .bits = 0, .width = 1, .signed = false },             .{ .bits = 255, .width = 1, .signed = false },
+        .{ .bits = S.signed(-128), .width = 1, .signed = true }, .{ .bits = S.signed(-1), .width = 1, .signed = true },
+        .{ .bits = 9, .width = 2, .signed = false },             .{ .bits = 65535, .width = 2, .signed = false },
+        .{ .bits = S.signed(-32768), .width = 2, .signed = true }, .{ .bits = 10, .width = 2, .signed = true },
+        .{ .bits = 100, .width = 4, .signed = false },           .{ .bits = 4294967295, .width = 4, .signed = false },
+        .{ .bits = S.signed(-2147483648), .width = 4, .signed = true }, .{ .bits = 1205, .width = 4, .signed = true },
+        .{ .bits = 0, .width = 8, .signed = true },              .{ .bits = S.signed(-10), .width = 8, .signed = true },
+        .{ .bits = 999_999_999_999_999, .width = 8, .signed = false },
+        .{ .bits = 9_999_999_999_999_999, .width = 8, .signed = false },
+        .{ .bits = 10_000_000_000_000_000, .width = 8, .signed = false },
+        .{ .bits = S.signed(-999_999_999_999_999), .width = 8, .signed = true },
+        .{ .bits = S.signed(-1_000_000_000_000_000), .width = 8, .signed = true },
+        .{ .bits = std.math.maxInt(u64), .width = 8, .signed = false },
+        .{ .bits = S.signed(std.math.minInt(i64)), .width = 8, .signed = true },
+        .{ .bits = std.math.maxInt(i64), .width = 8, .signed = true },
+        .{ .bits = std.math.maxInt(u128), .width = 16, .signed = false },
+        .{ .bits = S.signed(std.math.minInt(i128)), .width = 16, .signed = true },
+    };
+    for (cases) |case| {
+        const bits = case.bits;
+        var out: RocStr = undefined;
+        roc_builtins_int_to_str(&out, @truncate(bits), @truncate(bits >> 64), case.width, case.signed);
+        var expected_buffer: [48]u8 = undefined;
+        const expected = S.reference(&expected_buffer, bits, case.signed);
+        try std.testing.expect(out.eqlSlice(expected));
+        if (expected.len < @sizeOf(RocStr)) {
+            // A small result is byte for byte the one fromSliceSmall makes.
+            const small = RocStr.fromSliceSmall(expected);
+            try std.testing.expectEqualSlices(u8, std.mem.asBytes(&small), std.mem.asBytes(&out));
+        } else {
+            try std.testing.expect(!out.isSmallStr());
+            out.decref(env.getOps());
+        }
+    }
 }
 
 /// Unified float-to-string wrapper: dispatches on is_f32.
